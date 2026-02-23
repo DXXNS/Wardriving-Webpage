@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 
+export const dynamic = "force-dynamic";
+export const fetchCache = "force-no-store";
+
 const DEFAULT_CSV_URL =
   "https://raw.githubusercontent.com/DXXNS/Wardriving-DB/refs/heads/main/db.csv";
-
-const OSRM_MATCH_URL = "https://router.project-osrm.org/match/v1/driving";
 
 export interface WardrivingPoint {
   lat: number;
@@ -12,11 +13,6 @@ export interface WardrivingPoint {
   ssid: string;
   type: string;
   rssi: number;
-}
-
-interface MatchedLeg {
-  coordinates: [number, number][];
-  avgDensity: number;
 }
 
 function parseCSV(raw: string): WardrivingPoint[] {
@@ -56,108 +52,50 @@ function parseCSV(raw: string): WardrivingPoint[] {
   return points;
 }
 
-function sortPointsByProximity(
-  points: { lat: number; lng: number; count: number }[]
-): { lat: number; lng: number; count: number }[] {
-  if (points.length <= 1) return points;
-
-  const sorted: { lat: number; lng: number; count: number }[] = [];
-  const remaining = new Set(points.map((_, i) => i));
-
-  let currentIdx = 0;
-  remaining.delete(currentIdx);
-  sorted.push(points[currentIdx]);
-
-  while (remaining.size > 0) {
-    let closestIdx = -1;
-    let closestDist = Infinity;
-
-    for (const idx of remaining) {
-      const dist = Math.sqrt(
-        Math.pow(points[idx].lat - points[currentIdx].lat, 2) +
-          Math.pow(points[idx].lng - points[currentIdx].lng, 2)
-      );
-      if (dist < closestDist) {
-        closestDist = dist;
-        closestIdx = idx;
-      }
-    }
-
-    if (closestIdx !== -1) {
-      remaining.delete(closestIdx);
-      sorted.push(points[closestIdx]);
-      currentIdx = closestIdx;
-    }
-  }
-
-  return sorted;
-}
-
-async function matchToRoads(
-  points: { lat: number; lng: number; count: number }[]
-): Promise<MatchedLeg[]> {
-  const BATCH_SIZE = 80;
-  const matchedLegs: MatchedLeg[] = [];
-
-  for (let i = 0; i < points.length; i += BATCH_SIZE - 10) {
-    const batch = points.slice(i, i + BATCH_SIZE);
-    if (batch.length < 2) continue;
-
-    const coordinates = batch.map((p) => `${p.lng},${p.lat}`).join(";");
-    const radiuses = batch.map(() => "25").join(";");
-
-    const url = `${OSRM_MATCH_URL}/${coordinates}?overview=full&geometries=geojson&radiuses=${radiuses}&gaps=split`;
-
-    try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-      if (!res.ok) continue;
-
-      const data = await res.json();
-      if (data.code !== "Ok" || !data.matchings) continue;
-
-      for (const matching of data.matchings) {
-        if (matching.geometry && matching.geometry.coordinates) {
-          const coords = matching.geometry.coordinates as [number, number][];
-          const avgDensity =
-            batch.reduce((sum, p) => sum + p.count, 0) / batch.length;
-          matchedLegs.push({ coordinates: coords, avgDensity });
-        }
-      }
-    } catch {
-      continue;
-    }
-  }
-
-  return matchedLegs;
-}
-
 export async function GET(request: NextRequest) {
+  const csvUrl = request.nextUrl.searchParams.get("csv") || DEFAULT_CSV_URL;
+
+  console.log("(Wardriving App) Fetching CSV from:", csvUrl);
+
   try {
-    const csvUrl =
-      request.nextUrl.searchParams.get("csv") || DEFAULT_CSV_URL;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
 
     const response = await fetch(csvUrl, {
+      signal: controller.signal,
       cache: "no-store",
+      headers: {
+        "User-Agent": "WardriveScan/1.0",
+      },
     });
 
+    clearTimeout(timeout);
+
     if (!response.ok) {
+      console.log("(Wardriving App) CSV fetch failed with status:", response.status);
       return NextResponse.json(
-        { error: "Failed to fetch CSV data from URL" },
-        { status: 500 }
+        { error: `Failed to fetch CSV (HTTP ${response.status})` },
+        { status: 502 }
       );
     }
 
     const raw = await response.text();
+    console.log("(Wardriving App) CSV fetched, size:", raw.length, "bytes");
+
     const allPoints = parseCSV(raw);
+    console.log("(Wardriving App) Parsed", allPoints.length, "points");
 
     if (allPoints.length === 0) {
       return NextResponse.json(
-        { error: "No valid points found in CSV. Make sure the file uses WiGLE CSV format." },
+        {
+          error:
+            "No valid points found in CSV. Make sure the file uses WiGLE CSV format.",
+        },
         { status: 400 }
       );
     }
 
-    // Density grid
+    // Build density grid (~11m resolution)
     const densityMap = new Map<
       string,
       { lat: number; lng: number; count: number }
@@ -174,19 +112,8 @@ export async function GET(request: NextRequest) {
     }
 
     const densityPoints = Array.from(densityMap.values());
-    const sortedPoints = sortPointsByProximity(densityPoints);
-
-    // Try OSRM road matching (with timeout fallback)
-    let matchedLegs: MatchedLeg[] = [];
-    try {
-      matchedLegs = await matchToRoads(sortedPoints);
-    } catch {
-      // OSRM failed entirely, continue without it
-    }
 
     // Stats
-    const totalPoints = allPoints.length;
-    const uniqueLocations = densityPoints.length;
     const wifiPoints = allPoints.filter((p) => p.type === "WIFI").length;
     const blePoints = allPoints.filter(
       (p) => p.type === "BLE" || p.type === "BT"
@@ -212,13 +139,14 @@ export async function GET(request: NextRequest) {
 
     const maxCount = Math.max(...densityPoints.map((p) => p.count));
 
+    console.log("(Wardriving App) Returning", densityPoints.length, "density points, maxCount:", maxCount);
+
     return NextResponse.json({
-      matchedLegs,
       points: densityPoints,
       maxCount,
       stats: {
-        totalPoints,
-        uniqueLocations,
+        totalPoints: allPoints.length,
+        uniqueLocations: densityPoints.length,
         wifiPoints,
         blePoints,
         gsmPoints,
@@ -228,10 +156,9 @@ export async function GET(request: NextRequest) {
       center,
     });
   } catch (error) {
-    console.error("Error processing wardriving data:", error);
-    return NextResponse.json(
-      { error: "Failed to process data" },
-      { status: 500 }
-    );
+    const message =
+      error instanceof Error ? error.message : "Unknown error";
+    console.error("(Wardriving App) Error:", message);
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 }

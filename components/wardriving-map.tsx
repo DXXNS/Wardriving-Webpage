@@ -4,19 +4,16 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 
+const DEFAULT_CSV_URL =
+  "https://raw.githubusercontent.com/DXXNS/Wardriving-DB/refs/heads/main/db.csv";
+
 interface DensityPoint {
   lat: number;
   lng: number;
   count: number;
 }
 
-interface MatchedLeg {
-  coordinates: [number, number][];
-  avgDensity: number;
-}
-
 interface WardrivingData {
-  matchedLegs: MatchedLeg[];
   points: DensityPoint[];
   maxCount: number;
   stats: {
@@ -45,12 +42,7 @@ function getColorForDensity(count: number, maxCount: number): string {
 
 function getOpacityForDensity(count: number, maxCount: number): number {
   const ratio = count / maxCount;
-  return Math.max(0.6, Math.min(0.95, 0.5 + ratio * 0.5));
-}
-
-function getWeightForDensity(count: number, maxCount: number): number {
-  const ratio = count / maxCount;
-  return Math.max(4, Math.min(8, 3 + ratio * 5));
+  return Math.max(0.5, Math.min(0.95, 0.4 + ratio * 0.55));
 }
 
 export default function WardrivingMap() {
@@ -62,7 +54,7 @@ export default function WardrivingMap() {
   const watchIdRef = useRef<number | null>(null);
 
   const [data, setData] = useState<WardrivingData | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showStats, setShowStats] = useState(false);
   const [isTracking, setIsTracking] = useState(false);
@@ -71,42 +63,56 @@ export default function WardrivingMap() {
     lng: number;
   } | null>(null);
   const [customCsvUrl, setCustomCsvUrl] = useState("");
-  const [loadingCustom, setLoadingCustom] = useState(false);
+  const [started, setStarted] = useState(false);
 
   // Fetch wardriving data
-  const fetchData = useCallback(async (csvUrl?: string) => {
+  const fetchData = useCallback(async (csvUrl: string) => {
     setLoading(true);
     setError(null);
+    setStarted(true);
+
+    console.log("(Wardriving App) Starting fetch for:", csvUrl);
+
     try {
-      const url = csvUrl
-        ? `/api/wardriving?csv=${encodeURIComponent(csvUrl)}`
-        : "/api/wardriving";
-      const res = await fetch(url);
+      const apiUrl = `/api/wardriving?csv=${encodeURIComponent(csvUrl)}`;
+      console.log("(Wardriving App) Calling API:", apiUrl);
+
+      const res = await fetch(apiUrl);
+      console.log("(Wardriving App) API response status:", res.status);
+
       if (!res.ok) {
         const body = await res.json().catch(() => null);
-        throw new Error(body?.error || "Failed to fetch data");
+        const msg = body?.error || `Server returned ${res.status}`;
+        console.log("(Wardriving App) API error:", msg);
+        throw new Error(msg);
       }
+
       const json = await res.json();
+      console.log(
+        "(Wardriving App) Data received:",
+        json.points?.length,
+        "points, maxCount:",
+        json.maxCount
+      );
       setData(json);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unknown error");
+      const msg = err instanceof Error ? err.message : "Unknown error";
+      console.error("(Wardriving App) Fetch failed:", msg);
+      setError(msg);
     } finally {
       setLoading(false);
-      setLoadingCustom(false);
     }
   }, []);
-
-  useEffect(() => {
-    fetchData();
-  }, [fetchData]);
 
   // Initialize map
   useEffect(() => {
     if (!mapRef.current || mapInstanceRef.current) return;
 
+    console.log("(Wardriving App) Initializing Leaflet map");
+
     const map = L.map(mapRef.current, {
       center: [48.189, 14.099],
-      zoom: 15,
+      zoom: 13,
       zoomControl: false,
       attributionControl: false,
     });
@@ -146,7 +152,9 @@ export default function WardrivingMap() {
     dataLayersRef.current.forEach((layer) => map.removeLayer(layer));
     dataLayersRef.current = [];
 
-    const { matchedLegs, points, maxCount, bounds } = data;
+    const { points, maxCount, bounds } = data;
+
+    console.log("(Wardriving App) Rendering", points.length, "points on map");
 
     // Fit to data bounds
     map.fitBounds([
@@ -154,67 +162,55 @@ export default function WardrivingMap() {
       [bounds.maxLat + 0.002, bounds.maxLng + 0.002],
     ]);
 
-    if (matchedLegs && matchedLegs.length > 0) {
-      matchedLegs.forEach((leg) => {
-        if (!leg.coordinates || leg.coordinates.length < 2) return;
-
-        const latlngs: [number, number][] = leg.coordinates.map(
-          (coord) => [coord[1], coord[0]] as [number, number]
-        );
-
-        const color = getColorForDensity(leg.avgDensity, maxCount);
-
-        const glow = L.polyline(latlngs, {
-          color: color,
-          weight: getWeightForDensity(leg.avgDensity, maxCount) + 6,
-          opacity: 0.15,
-          lineJoin: "round",
-          lineCap: "round",
-        }).addTo(map);
-        dataLayersRef.current.push(glow);
-
-        const line = L.polyline(latlngs, {
-          color: color,
-          weight: getWeightForDensity(leg.avgDensity, maxCount),
-          opacity: getOpacityForDensity(leg.avgDensity, maxCount),
-          lineJoin: "round",
-          lineCap: "round",
-        }).addTo(map);
-        dataLayersRef.current.push(line);
-      });
-    }
-
-    // Always render points as a fallback/supplement
     if (points && points.length > 0) {
-      points.forEach((p) => {
+      // Sort by count ascending so high-density renders on top
+      const sorted = [...points].sort((a, b) => a.count - b.count);
+
+      sorted.forEach((p) => {
         const color = getColorForDensity(p.count, maxCount);
-        const marker = L.circleMarker([p.lat, p.lng], {
-          radius: Math.max(2, Math.min(5, 1.5 + (p.count / maxCount) * 3.5)),
+        const ratio = p.count / maxCount;
+        const radius = Math.max(3, Math.min(8, 2 + ratio * 6));
+
+        // Glow layer
+        const glow = L.circleMarker([p.lat, p.lng], {
+          radius: radius + 3,
           fillColor: color,
-          fillOpacity: 0.6,
+          fillOpacity: 0.12,
           color: color,
           weight: 0,
         }).addTo(map);
+        dataLayersRef.current.push(glow);
+
+        // Main marker
+        const marker = L.circleMarker([p.lat, p.lng], {
+          radius: radius,
+          fillColor: color,
+          fillOpacity: getOpacityForDensity(p.count, maxCount),
+          color: color,
+          weight: 1,
+          opacity: 0.4,
+        }).addTo(map);
         dataLayersRef.current.push(marker);
       });
+
+      console.log("(Wardriving App) Rendered all points on map");
     }
   }, [data]);
 
-  const handleLoadCustomCsv = () => {
-    if (!customCsvUrl.trim()) return;
-    setLoadingCustom(true);
-    fetchData(customCsvUrl.trim());
-  };
-
   // Live location tracking
   const startTracking = useCallback(() => {
-    if (!("geolocation" in navigator)) return;
+    if (!("geolocation" in navigator)) {
+      console.log("(Wardriving App) Geolocation not available");
+      return;
+    }
 
+    console.log("(Wardriving App) Starting location tracking");
     setIsTracking(true);
 
     watchIdRef.current = navigator.geolocation.watchPosition(
       (position) => {
         const { latitude, longitude, accuracy } = position.coords;
+        console.log("(Wardriving App) Location update:", latitude, longitude, "accuracy:", accuracy);
         setUserLocation({ lat: latitude, lng: longitude });
 
         if (mapInstanceRef.current) {
@@ -249,7 +245,8 @@ export default function WardrivingMap() {
           }
         }
       },
-      () => {
+      (err) => {
+        console.log("(Wardriving App) Location error:", err.message);
         setIsTracking(false);
       },
       {
@@ -261,6 +258,7 @@ export default function WardrivingMap() {
   }, []);
 
   const stopTracking = useCallback(() => {
+    console.log("(Wardriving App) Stopping location tracking");
     if (watchIdRef.current !== null) {
       navigator.geolocation.clearWatch(watchIdRef.current);
       watchIdRef.current = null;
@@ -293,8 +291,105 @@ export default function WardrivingMap() {
 
   return (
     <div className="relative h-screen w-screen overflow-hidden bg-[#0f172a]">
-      {/* Map container */}
+      {/* Map container - always mounted */}
       <div ref={mapRef} className="absolute inset-0 z-0" />
+
+      {/* Start screen - shows before any data is loaded */}
+      {!started && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-[#0f172a]/95 backdrop-blur-sm">
+          <div className="mx-4 w-full max-w-md">
+            <div className="rounded-2xl bg-[#1e293b] p-6 shadow-2xl shadow-black/40">
+              {/* Logo */}
+              <div className="mb-6 flex items-center justify-center gap-3">
+                <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#3b82f6]/20">
+                  <svg
+                    width="22"
+                    height="22"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="#3b82f6"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <path d="M5.5 8.5 9 12l-3.5 3.5L2 12l3.5-3.5Z" />
+                    <path d="m12 2 3.5 3.5L12 9 8.5 5.5 12 2Z" />
+                    <path d="M18.5 8.5 22 12l-3.5 3.5L15 12l3.5-3.5Z" />
+                    <path d="m12 15 3.5 3.5L12 22l-3.5-3.5L12 15Z" />
+                  </svg>
+                </div>
+                <div>
+                  <h1 className="text-lg font-bold text-[#e2e8f0]">
+                    WardriveScan
+                  </h1>
+                  <p className="text-xs text-[#64748b]">
+                    Wardriving data visualizer
+                  </p>
+                </div>
+              </div>
+
+              {/* CSV URL input */}
+              <label className="mb-1 block text-xs font-medium text-[#94a3b8]">
+                Custom CSV URL (WiGLE format)
+              </label>
+              <input
+                type="url"
+                placeholder="https://example.com/data.csv"
+                value={customCsvUrl}
+                onChange={(e) => setCustomCsvUrl(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && customCsvUrl.trim()) {
+                    fetchData(customCsvUrl.trim());
+                  }
+                }}
+                className="mb-4 w-full rounded-lg bg-[#0f172a] px-3 py-2.5 text-sm text-[#e2e8f0] placeholder-[#475569] outline-none ring-1 ring-[#334155] transition-all focus:ring-[#3b82f6]"
+              />
+
+              {/* Buttons */}
+              <div className="flex flex-col gap-2">
+                <button
+                  onClick={() => {
+                    if (customCsvUrl.trim()) {
+                      fetchData(customCsvUrl.trim());
+                    }
+                  }}
+                  disabled={!customCsvUrl.trim()}
+                  className="w-full rounded-lg bg-[#3b82f6] px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-[#2563eb] disabled:cursor-not-allowed disabled:opacity-30"
+                >
+                  Load CSV from URL
+                </button>
+                <button
+                  onClick={() => {
+                    console.log("(Wardriving App) Loading default CSV");
+                    fetchData(DEFAULT_CSV_URL);
+                  }}
+                  className="w-full rounded-lg bg-[#334155] px-4 py-2.5 text-sm font-medium text-[#e2e8f0] transition-colors hover:bg-[#475569]"
+                >
+                  Use Default Database
+                </button>
+              </div>
+
+              {/* Credit */}
+              <div className="mt-5 flex items-center justify-center">
+                <span className="flex items-center gap-1.5 text-xs text-[#475569]">
+                  Made with
+                  <svg
+                    width="12"
+                    height="12"
+                    viewBox="0 0 24 24"
+                    fill="#ef4444"
+                    stroke="none"
+                  >
+                    <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z" />
+                  </svg>
+                  by{" "}
+                  <span className="font-medium text-[#94a3b8]">DXXNS</span>
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Loading overlay */}
       {loading && (
@@ -302,7 +397,7 @@ export default function WardrivingMap() {
           <div className="flex flex-col items-center gap-4">
             <div className="h-10 w-10 animate-spin rounded-full border-2 border-[#3b82f6] border-t-transparent" />
             <p className="text-sm text-[#94a3b8]">
-              {loadingCustom ? "Loading custom CSV..." : "Loading wardriving data..."}
+              Loading wardriving data...
             </p>
           </div>
         </div>
@@ -310,247 +405,276 @@ export default function WardrivingMap() {
 
       {/* Error overlay */}
       {error && !loading && (
-        <div className="absolute inset-0 z-50 flex items-center justify-center bg-[#0f172a]/80 backdrop-blur-sm">
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-[#0f172a]/90 backdrop-blur-sm">
           <div className="mx-4 max-w-md rounded-xl bg-[#1e293b] p-6 text-center">
-            <p className="text-sm text-[#ef4444]">Error: {error}</p>
-            <button
-              onClick={() => {
-                setError(null);
-                fetchData();
-              }}
-              className="mt-4 rounded-lg bg-[#3b82f6] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#2563eb]"
-            >
-              Retry with default
-            </button>
+            <p className="mb-1 text-sm font-medium text-[#ef4444]">
+              Failed to load data
+            </p>
+            <p className="mb-4 text-xs text-[#64748b]">{error}</p>
+            <div className="flex flex-col gap-2">
+              <button
+                onClick={() => {
+                  setError(null);
+                  setStarted(false);
+                }}
+                className="rounded-lg bg-[#334155] px-4 py-2 text-sm font-medium text-[#e2e8f0] transition-colors hover:bg-[#475569]"
+              >
+                Back to start
+              </button>
+              <button
+                onClick={() => {
+                  console.log("(Wardriving App) Retrying with default");
+                  fetchData(DEFAULT_CSV_URL);
+                }}
+                className="rounded-lg bg-[#3b82f6] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#2563eb]"
+              >
+                Try Default Database
+              </button>
+            </div>
           </div>
         </div>
       )}
 
-      {/* Top left - title + custom CSV input */}
-      <div className="absolute left-4 top-4 z-10 flex flex-col gap-2 md:left-6 md:top-6">
-        {/* Title bar */}
-        <div className="flex items-center gap-3 rounded-xl bg-[#0f172a]/90 px-4 py-3 shadow-lg shadow-black/30 backdrop-blur-md md:min-w-[340px]">
-          <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#3b82f6]/20">
-            <svg
-              width="18"
-              height="18"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="#3b82f6"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M5.5 8.5 9 12l-3.5 3.5L2 12l3.5-3.5Z" />
-              <path d="m12 2 3.5 3.5L12 9 8.5 5.5 12 2Z" />
-              <path d="M18.5 8.5 22 12l-3.5 3.5L15 12l3.5-3.5Z" />
-              <path d="m12 15 3.5 3.5L12 22l-3.5-3.5L12 15Z" />
-            </svg>
-          </div>
-          <div>
-            <h1 className="text-sm font-semibold text-[#e2e8f0]">
-              WardriveScan
-            </h1>
-            <p className="text-xs text-[#64748b]">
-              {data
-                ? `${data.stats.uniqueLocations.toLocaleString()} locations mapped`
-                : "Loading..."}
-            </p>
-          </div>
-        </div>
-
-        {/* Custom CSV URL input */}
-        <div className="rounded-xl bg-[#0f172a]/90 p-3 shadow-lg shadow-black/30 backdrop-blur-md md:min-w-[340px]">
-          <input
-            type="url"
-            placeholder="Paste a .csv URL here..."
-            value={customCsvUrl}
-            onChange={(e) => setCustomCsvUrl(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") handleLoadCustomCsv();
-            }}
-            className="w-full rounded-lg bg-[#1e293b] px-3 py-2 text-xs text-[#e2e8f0] placeholder-[#475569] outline-none ring-1 ring-[#334155] transition-all focus:ring-[#3b82f6]"
-          />
-          <button
-            onClick={handleLoadCustomCsv}
-            disabled={!customCsvUrl.trim() || loadingCustom}
-            className="mt-2 w-full rounded-lg bg-[#3b82f6] px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-[#2563eb] disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            {loadingCustom ? "Loading..." : "Load CSV"}
-          </button>
-        </div>
-      </div>
-
-      {/* Right side controls */}
-      <div className="absolute right-4 top-4 z-10 flex flex-col gap-2 md:right-6 md:top-6">
-        <button
-          onClick={() => setShowStats((prev) => !prev)}
-          className="flex h-10 w-10 items-center justify-center rounded-lg bg-[#0f172a]/90 shadow-lg shadow-black/30 backdrop-blur-md transition-colors hover:bg-[#1e293b]"
-          title="Toggle Stats"
-        >
-          <svg
-            width="18"
-            height="18"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke={showStats ? "#3b82f6" : "#94a3b8"}
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          >
-            <path d="M3 3v18h18" />
-            <path d="M18 17V9" />
-            <path d="M13 17V5" />
-            <path d="M8 17v-3" />
-          </svg>
-        </button>
-
-        <button
-          onClick={isTracking ? stopTracking : startTracking}
-          className="flex h-10 w-10 items-center justify-center rounded-lg bg-[#0f172a]/90 shadow-lg shadow-black/30 backdrop-blur-md transition-colors hover:bg-[#1e293b]"
-          title={isTracking ? "Stop tracking" : "Track my location"}
-        >
-          <svg
-            width="18"
-            height="18"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke={isTracking ? "#22d3ee" : "#94a3b8"}
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          >
-            <circle cx="12" cy="12" r="3" />
-            <path d="M12 2v4" />
-            <path d="M12 18v4" />
-            <path d="M2 12h4" />
-            <path d="M18 12h4" />
-          </svg>
-        </button>
-
-        {isTracking && userLocation && (
-          <button
-            onClick={centerOnUser}
-            className="flex h-10 w-10 items-center justify-center rounded-lg bg-[#0f172a]/90 shadow-lg shadow-black/30 backdrop-blur-md transition-colors hover:bg-[#1e293b]"
-            title="Center on my location"
-          >
-            <svg
-              width="18"
-              height="18"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="#22d3ee"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <polygon points="3 11 22 2 13 21 11 13 3 11" />
-            </svg>
-          </button>
-        )}
-
-        <button
-          onClick={centerOnData}
-          className="flex h-10 w-10 items-center justify-center rounded-lg bg-[#0f172a]/90 shadow-lg shadow-black/30 backdrop-blur-md transition-colors hover:bg-[#1e293b]"
-          title="Center on wardriving data"
-        >
-          <svg
-            width="18"
-            height="18"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="#94a3b8"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          >
-            <rect x="3" y="3" width="18" height="18" rx="2" />
-            <path d="M3 9h18" />
-            <path d="M3 15h18" />
-            <path d="M9 3v18" />
-            <path d="M15 3v18" />
-          </svg>
-        </button>
-      </div>
-
-      {/* Stats panel */}
-      {showStats && data && (
-        <div className="absolute bottom-20 left-4 right-4 z-10 md:bottom-auto md:left-auto md:right-6 md:top-[220px] md:w-[280px]">
-          <div className="rounded-xl bg-[#0f172a]/90 p-4 shadow-lg shadow-black/30 backdrop-blur-md">
-            <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-[#64748b]">
-              Scan Statistics
-            </h2>
-            <div className="grid grid-cols-2 gap-3">
-              <StatItem
-                label="Total Points"
-                value={data.stats.totalPoints.toLocaleString()}
-              />
-              <StatItem
-                label="Locations"
-                value={data.stats.uniqueLocations.toLocaleString()}
-              />
-              <StatItem
-                label="WiFi"
-                value={data.stats.wifiPoints.toLocaleString()}
-                color="#3b82f6"
-              />
-              <StatItem
-                label="BLE/BT"
-                value={data.stats.blePoints.toLocaleString()}
-                color="#a855f7"
-              />
-              <StatItem
-                label="GSM"
-                value={data.stats.gsmPoints.toLocaleString()}
-                color="#f59e0b"
-              />
-              <StatItem
-                label="SSIDs"
-                value={data.stats.uniqueSSIDs.toLocaleString()}
-                color="#22d3ee"
-              />
+      {/* Map UI overlays - only show once data is loaded */}
+      {data && !loading && !error && (
+        <>
+          {/* Top left - title + custom CSV input */}
+          <div className="absolute left-4 top-4 z-10 flex flex-col gap-2 md:left-6 md:top-6">
+            {/* Title bar */}
+            <div className="flex items-center gap-3 rounded-xl bg-[#0f172a]/90 px-4 py-3 shadow-lg shadow-black/30 backdrop-blur-md">
+              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#3b82f6]/20">
+                <svg
+                  width="18"
+                  height="18"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="#3b82f6"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="M5.5 8.5 9 12l-3.5 3.5L2 12l3.5-3.5Z" />
+                  <path d="m12 2 3.5 3.5L12 9 8.5 5.5 12 2Z" />
+                  <path d="M18.5 8.5 22 12l-3.5 3.5L15 12l3.5-3.5Z" />
+                  <path d="m12 15 3.5 3.5L12 22l-3.5-3.5L12 15Z" />
+                </svg>
+              </div>
+              <div>
+                <h1 className="text-sm font-semibold text-[#e2e8f0]">
+                  WardriveScan
+                </h1>
+                <p className="text-xs text-[#64748b]">
+                  {data.stats.uniqueLocations.toLocaleString()} locations mapped
+                </p>
+              </div>
             </div>
 
-            <div className="mt-4 border-t border-[#1e293b] pt-3">
-              <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-[#64748b]">
-                Density
-              </h3>
-              <div className="flex items-center gap-4">
-                <LegendItem color="#3b82f6" label="Low" />
-                <LegendItem color="#f59e0b" label="Medium" />
-                <LegendItem color="#ef4444" label="High" />
+            {/* Custom CSV URL input */}
+            <div className="rounded-xl bg-[#0f172a]/90 p-3 shadow-lg shadow-black/30 backdrop-blur-md md:min-w-[320px]">
+              <input
+                type="url"
+                placeholder="Paste a .csv URL here..."
+                value={customCsvUrl}
+                onChange={(e) => setCustomCsvUrl(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && customCsvUrl.trim()) {
+                    fetchData(customCsvUrl.trim());
+                  }
+                }}
+                className="w-full rounded-lg bg-[#1e293b] px-3 py-2 text-xs text-[#e2e8f0] placeholder-[#475569] outline-none ring-1 ring-[#334155] transition-all focus:ring-[#3b82f6]"
+              />
+              <div className="mt-2 flex gap-2">
+                <button
+                  onClick={() => {
+                    if (customCsvUrl.trim()) fetchData(customCsvUrl.trim());
+                  }}
+                  disabled={!customCsvUrl.trim()}
+                  className="flex-1 rounded-lg bg-[#3b82f6] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#2563eb] disabled:cursor-not-allowed disabled:opacity-30"
+                >
+                  Load CSV
+                </button>
+                <button
+                  onClick={() => fetchData(DEFAULT_CSV_URL)}
+                  className="rounded-lg bg-[#334155] px-3 py-1.5 text-xs font-medium text-[#e2e8f0] transition-colors hover:bg-[#475569]"
+                >
+                  Default
+                </button>
               </div>
             </div>
           </div>
-        </div>
-      )}
 
-      {/* Bottom bar: legend + credit */}
-      <div className="absolute bottom-4 left-4 right-4 z-10 flex items-end justify-between">
-        {/* Legend (mobile) */}
-        <div className="flex items-center gap-3 rounded-lg bg-[#0f172a]/90 px-3 py-2 shadow-lg shadow-black/30 backdrop-blur-md md:hidden">
-          <LegendItem color="#3b82f6" label="Low" />
-          <LegendItem color="#f59e0b" label="Med" />
-          <LegendItem color="#ef4444" label="High" />
-        </div>
-
-        {/* Made by DXXNS */}
-        <div className="rounded-lg bg-[#0f172a]/90 px-3 py-2 shadow-lg shadow-black/30 backdrop-blur-md">
-          <span className="flex items-center gap-1.5 text-xs text-[#64748b]">
-            Made with{" "}
-            <svg
-              width="12"
-              height="12"
-              viewBox="0 0 24 24"
-              fill="#ef4444"
-              stroke="none"
+          {/* Right side controls */}
+          <div className="absolute right-4 top-4 z-10 flex flex-col gap-2 md:right-6 md:top-6">
+            <button
+              onClick={() => setShowStats((prev) => !prev)}
+              className="flex h-10 w-10 items-center justify-center rounded-lg bg-[#0f172a]/90 shadow-lg shadow-black/30 backdrop-blur-md transition-colors hover:bg-[#1e293b]"
+              title="Toggle Stats"
             >
-              <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z" />
-            </svg>{" "}
-            by <span className="font-medium text-[#94a3b8]">DXXNS</span>
-          </span>
-        </div>
-      </div>
+              <svg
+                width="18"
+                height="18"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke={showStats ? "#3b82f6" : "#94a3b8"}
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M3 3v18h18" />
+                <path d="M18 17V9" />
+                <path d="M13 17V5" />
+                <path d="M8 17v-3" />
+              </svg>
+            </button>
+
+            <button
+              onClick={isTracking ? stopTracking : startTracking}
+              className="flex h-10 w-10 items-center justify-center rounded-lg bg-[#0f172a]/90 shadow-lg shadow-black/30 backdrop-blur-md transition-colors hover:bg-[#1e293b]"
+              title={isTracking ? "Stop tracking" : "Track my location"}
+            >
+              <svg
+                width="18"
+                height="18"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke={isTracking ? "#22d3ee" : "#94a3b8"}
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <circle cx="12" cy="12" r="3" />
+                <path d="M12 2v4" />
+                <path d="M12 18v4" />
+                <path d="M2 12h4" />
+                <path d="M18 12h4" />
+              </svg>
+            </button>
+
+            {isTracking && userLocation && (
+              <button
+                onClick={centerOnUser}
+                className="flex h-10 w-10 items-center justify-center rounded-lg bg-[#0f172a]/90 shadow-lg shadow-black/30 backdrop-blur-md transition-colors hover:bg-[#1e293b]"
+                title="Center on my location"
+              >
+                <svg
+                  width="18"
+                  height="18"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="#22d3ee"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <polygon points="3 11 22 2 13 21 11 13 3 11" />
+                </svg>
+              </button>
+            )}
+
+            <button
+              onClick={centerOnData}
+              className="flex h-10 w-10 items-center justify-center rounded-lg bg-[#0f172a]/90 shadow-lg shadow-black/30 backdrop-blur-md transition-colors hover:bg-[#1e293b]"
+              title="Fit data bounds"
+            >
+              <svg
+                width="18"
+                height="18"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="#94a3b8"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <rect x="3" y="3" width="18" height="18" rx="2" />
+                <path d="M3 9h18" />
+                <path d="M3 15h18" />
+                <path d="M9 3v18" />
+                <path d="M15 3v18" />
+              </svg>
+            </button>
+          </div>
+
+          {/* Stats panel */}
+          {showStats && (
+            <div className="absolute bottom-20 left-4 right-4 z-10 md:bottom-auto md:left-auto md:right-6 md:top-[220px] md:w-[280px]">
+              <div className="rounded-xl bg-[#0f172a]/90 p-4 shadow-lg shadow-black/30 backdrop-blur-md">
+                <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-[#64748b]">
+                  Scan Statistics
+                </h2>
+                <div className="grid grid-cols-2 gap-3">
+                  <StatItem
+                    label="Total Points"
+                    value={data.stats.totalPoints.toLocaleString()}
+                  />
+                  <StatItem
+                    label="Locations"
+                    value={data.stats.uniqueLocations.toLocaleString()}
+                  />
+                  <StatItem
+                    label="WiFi"
+                    value={data.stats.wifiPoints.toLocaleString()}
+                    color="#3b82f6"
+                  />
+                  <StatItem
+                    label="BLE/BT"
+                    value={data.stats.blePoints.toLocaleString()}
+                    color="#a855f7"
+                  />
+                  <StatItem
+                    label="GSM"
+                    value={data.stats.gsmPoints.toLocaleString()}
+                    color="#f59e0b"
+                  />
+                  <StatItem
+                    label="SSIDs"
+                    value={data.stats.uniqueSSIDs.toLocaleString()}
+                    color="#22d3ee"
+                  />
+                </div>
+
+                <div className="mt-4 border-t border-[#1e293b] pt-3">
+                  <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-[#64748b]">
+                    Density
+                  </h3>
+                  <div className="flex items-center gap-4">
+                    <LegendItem color="#3b82f6" label="Low" />
+                    <LegendItem color="#f59e0b" label="Medium" />
+                    <LegendItem color="#ef4444" label="High" />
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Bottom bar */}
+          <div className="absolute bottom-4 left-4 right-4 z-10 flex items-end justify-between">
+            {/* Legend */}
+            <div className="flex items-center gap-3 rounded-lg bg-[#0f172a]/90 px-3 py-2 shadow-lg shadow-black/30 backdrop-blur-md">
+              <LegendItem color="#3b82f6" label="Low" />
+              <LegendItem color="#f59e0b" label="Med" />
+              <LegendItem color="#ef4444" label="High" />
+            </div>
+
+            {/* Made by DXXNS */}
+            <div className="rounded-lg bg-[#0f172a]/90 px-3 py-2 shadow-lg shadow-black/30 backdrop-blur-md">
+              <span className="flex items-center gap-1.5 text-xs text-[#64748b]">
+                Made with
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="#ef4444"
+                  stroke="none"
+                >
+                  <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z" />
+                </svg>
+                by <span className="font-medium text-[#94a3b8]">DXXNS</span>
+              </span>
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }
