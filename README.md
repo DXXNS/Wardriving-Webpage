@@ -1,6 +1,9 @@
 
 
-# WardriveVisualizer V2
+# WardriveVisualizer V2 <a href="https://wigle.net">
+<img border="0" src="https://wigle.net/bi/jLMtqK6AajNmjLCFhXoCcw.png">
+</a> 
+
 
 A dark-themed, map-based wardriving visualization app built with **Next.js** and **Leaflet**.
 
@@ -129,8 +132,4 @@ No external storage or automatic uploads beyond the configured CSV source.
 ## 👤 Author
 
 DXXNS 
-
-<a href="https://wigle.net">
-<img border="0" src="https://wigle.net/bi/jLMtqK6AajNmjLCFhXoCcw.png">
-</a> 
 
