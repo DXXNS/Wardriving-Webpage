@@ -80,8 +80,8 @@ styles/
 ## 🛠 Installation
 
 ```bash
-git clone https://github.com/sev-ex/limerence.wtf-website-v2.git
-cd limerence.wtf-website-v2
+git clone https://github.com/DXXNS/Wardriving-Webpage.git
+cd Wardriving-Webpage
 npm install
 npm run dev
 ```
